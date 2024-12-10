@@ -1,0 +1,440 @@
+---
+title: "K Nearest Neighbors Regression to Predict Wind Turbine Capacity"
+author: "Andrea Boskovic"
+date: "12/15/2021"
+link-citations: yes
+output:
+  bookdown::pdf_document2:
+    includes:
+      keep_tex: yes
+    number_sections: yes
+tables: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      cache = TRUE)
+library(tidyverse)
+library(tidymodels)
+library(kableExtra)
+library(knitr)
+library(reticulate)
+library(gridExtra)
+library(GGally)
+library(DALEX)
+library(DALEXtra)
+library(MASS)
+theme_set(theme_bw())
+set.seed(535)
+```
+
+\newpage
+
+# Background {#background}
+
+The main goal of this project is to use K-Nearest Neighbors (KNN) Regression to predict turbine capacity using a modified version of the features in the United States Wind Turbine dataset. Our dataset contains information about the location of the wind turbine, the year it became operational, and various statistics about the turbine's operation, such as its height and rotor diameter. We explain how we reach the optimal model that minimizes our objective loss: Mean Square Error (MSE).
+
+```{r}
+# Import data
+pd <- import("pandas")
+X_train <- pd$read_pickle("X_train.pkl")
+y_train <- pd$read_pickle("y_train.pkl")
+X_test <- read_csv("X_test.csv")
+```
+
+# Preprocessing {#preprocessing}
+
+To create a best fit model, we first have to clean our dataset. The first step in this process involves dealing with missing values.
+
+We remove the feature representing the retrofit year, a representation of when the turbine was partially retrofit, because over 90\% of observations in this column are missing. The retrofit feature, which is an indicator variable showing whether or not the turbine has been partially retrofit, contains information that can be a useful substitute for retrofit year. 
+
+When we check for other missing values, we see that one row in our training set at index 10682 contains missing values in three columns, namely in that of the rotor diameter, rotor swept area, and turbine total height from ground to tip. We remove this observation from the dataset. This observation's removal should not alter the dataset significantly because we are only removing one row from a dataest with 50,000 observations.
+
+The next step in our data preprocessing involves verifying that each of our features are of the correct type. State and county are both character types, so we transform these into factor variables so that the model treats them as categorical. Similarly, since the retrofit indicator variable is numeric, we also transform this into a factor. Note that we must perform these transformations of our data, including removing the retrofit year feature, on the test set as well.
+
+Our last preprocessing step involves training our KNN Regression model. When we train our model, we normalize the numeric features by centering and scaling them. 
+
+```{r}
+# Remove retrofit_year because most entries (>90%) are NA
+prop_missing <- X_train %>%
+  dplyr::select(retrofit_year) %>%
+  summarise(prop_na = sum(is.na(retrofit_year))/nrow(X_train))
+
+X_train <- X_train %>%
+  dplyr::select(-retrofit_year)
+X_test <- X_test %>%
+  dplyr::select(-retrofit_year)
+
+# Check for any other missing values
+y_train <- as.data.frame(y_train[-c(which(is.na(X_train), arr.ind = TRUE)[1]), ])
+colnames(y_train) <- c("t_cap")
+X_test <- X_test[-c(which(is.na(X_train), arr.ind = TRUE)[1]), ]
+X_train <- X_train[-c(which(is.na(X_train), arr.ind = TRUE)[1]), ]
+
+# Make retrofit, state, and county into factors
+X_train <- X_train %>%
+  mutate(retrofit = as.factor(retrofit),
+         t_state = as.factor(t_state),
+         t_county = as.factor(t_county))
+X_test <- X_test %>%
+  mutate(retrofit = as.factor(retrofit),
+         t_state = as.factor(t_state),
+         t_county = as.factor(t_county))
+
+# Create full training set with combined X and y
+train_full <- cbind(X_train, y_train)
+```
+
+# Predictors {#predictors}
+
+After testing combinations of features in our KNN Regression model, we find that the predictor that achieves the lowest MSE on the training set is 
+
+$$\text{t\_cap} \sim \text{t\_rsa} + \text{t\_hh} + \text{p\_year} + \text{retrofit} + \text{t\_ttlh} + \text{xlong} + \text{ylat},$$
+
+where each of the variables are defined in Table 1.
+
+```{r}
+vars_names <- c("t_cap", "t_rsa", "t_hh", "p_year", "retrofit", "t_ttlh", "xlong", "ylat")
+full_names <- c("Capacity", "Rotor Swept Area", "Hub Height", "Year Operational", "Retrofit", "Total Height", "Longitude", "Latitude")
+var_type <- c("Numeric", "Numeric", "Numeric", "Numeric", "Categorical",
+              "Numeric", "Numeric", "Numeric")
+
+names <- tibble(`Full Name` = full_names, 
+                `Variable Name` = vars_names,
+                `Variable Type` = var_type)
+knitr::kable(names, 
+             caption = "The meanings of variable names in the selected model.")
+```
+
+Intuitively, it makes sense that most of these features would affect a turbine's capacity. If a rotor sweeps more area and is taller, it should generate more energy. Similarly, newer and retrofitted turbines are likely to have a higher capacity because they were more recently built or updated. A turbine's latitude and longitude also might affect its capacity because some areas likely have windier conditions than others, allowing a turbine to generate more energy.
+
+Note that the value of $K$ selected for the KNN Regression on this model is 2, which we found through cross validation, and details on selecting optimal $K$ are given in Section \@ref(training) and Section \@ref(experimental-results).
+
+## Exploratory Data Analysis {#exploratory-data-analysis}
+
+To better understand the features in the model, we visualize each of their effects on our target variable, turbine capacity, in Figure \@ref(fig:eda). We show the turbine capacity against hub height, rotor swept area, and total turbine height, and in each of these visualizations, we fit a linear model to the data, shown in green, to better understand their relationships.
+
+```{r}
+h1 <- ggplot(data = train_full, aes(x = t_hh, y = t_cap)) +
+  geom_point(alpha = 0.3, color = "firebrick") +
+  geom_smooth(method = 'lm', color = "darkgreen") + 
+  labs(x = "Hub Height (m)",
+       y = "Capacity (kW)",
+       title = "Capacity vs. Hub Height") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 15))
+```
+
+
+```{r}
+h3 <- ggplot(data = train_full, aes(x = t_rsa, y = t_cap)) +
+  geom_point(alpha = 0.3, color = "firebrick") +
+  geom_smooth(method = 'lm', color = "darkgreen") + 
+  labs(x = "Turbine Rotor Swept Area (m^2)",
+       y = "Capacity (kW)",
+       title = " Capacity vs. Swept Area") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 15))
+```
+
+```{r}
+h4 <- ggplot(data = train_full, aes(x = t_ttlh, y = t_cap)) +
+  geom_point(alpha = 0.3, color = "firebrick") +
+  geom_smooth(method = 'lm', color = "darkgreen") + 
+  labs(x = "Total Height (m)",
+       y = "Capacity (kW)",
+       title = "Capacity vs. Total Height") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 15))
+```
+
+```{r eda, fig.height = 4.3, fig.width = 5.7, fig.cap="An exploratory data visualization of turbine capacity against some predictors in our KNN Regression model."}
+grid.arrange(h1, h3, h4,
+             layout_matrix = rbind(c(1), c(3, 4)))
+```
+
+In each of these plots, we see that a linear model seems to fit the data decently well overall except in the tails, particularly on the lower end.
+
+\newpage
+
+# Training {#training}
+
+In training KNN Regression to predict turbine capacity using our set of predictors, as stated in Section \@ref(predictors), we choose $K=2$ for the number of neighbors. To find this optimal value of $K$, we performed K-Fold Cross Validation. 
+
+Using cross validation, we examine values of $K$, namely integers, between one and twenty. We use ten folds in this cross validation because this value seems appropriate given that the training dataset contains 50,000 observations. In other words, for each value of $K$, where $K$ represents the possible number of neighbors, we train a KNN Regression predictor on $50,0000 - \frac{50,000}{10} = 45,000$ observations and test it on the remaining 5,000 observations. Our ten-fold cross validation finds that $K=2$ successfully minimizes the MSE for the model we choose compared to other values of $K \in \{1, 2, \dots, 20\}.$
+
+The model we choose, specified in Section \@ref(predictors), is chosen by trial and error. Namely, we test several combinations of predictors and choose the model that minimizes the MSE on the training set.
+
+```{r}
+# Select only the features we want
+train_full <- train_full %>%
+  dplyr::select(t_cap, t_rsa, t_hh, p_year, retrofit, t_ttlh, xlong, ylat)
+X_train <- X_train %>%
+  dplyr::select(t_rsa, t_hh, p_year, retrofit, t_ttlh, xlong, ylat)
+X_test <- X_test %>%
+  dplyr::select(t_rsa, t_hh, p_year, retrofit, t_ttlh, xlong, ylat)
+```
+
+```{r}
+# Create wind recipe
+wind_rec <-
+  recipe(t_cap ~ .,
+         data = train_full) %>%
+  step_novel(all_nominal(), -all_outcomes()) %>%
+  step_normalize(all_numeric(), -all_outcomes(),
+                 -xlong, -ylat)
+#summary(wind_rec)
+```
+
+```{r}
+prepped_data <- 
+  wind_rec %>% 
+  prep() %>%
+  juice()
+#glimpse(prepped_data)
+```
+
+```{r}
+# Create KNN Model
+knn_spec <- 
+  nearest_neighbor() %>% 
+  set_args(neighbors = tune()) %>%
+  set_engine("kknn") %>% 
+  set_mode("regression") 
+
+knn_wflow <-
+ workflow() %>%
+ add_recipe(wind_rec) %>% 
+ add_model(knn_spec)
+```
+
+```{r}
+# K-fold CV
+wind_cv <- vfold_cv(train_full, v = 10) # 10-fold CV
+k_grid <- expand.grid(neighbors = c(1:20)) # try k (neighbors) values 1-20
+
+knn_tune <- knn_wflow %>%
+  tune_grid(resamples = wind_cv, 
+            grid = k_grid, 
+            metrics = metric_set(rmse) # minimizing rmse equivalent to minimizing mse
+            )
+
+# knn_tune %>%
+#   collect_metrics() %>%
+#   mutate(mse = mean^2)
+```
+
+```{r}
+# Plot for Choice of K
+k_plt <- 
+  knn_tune %>% 
+  collect_metrics() %>% 
+  mutate(mse = mean^2) %>%
+  ggplot(aes(x = neighbors, y = mse)) + 
+  geom_point() + 
+  geom_line() + 
+  labs(x = "Number of Neighbors (K)",
+       y = "Mean Square Error (MSE)",
+       title = "MSE vs. K",
+       caption = "Number of Neighbors (K) is log-scaled for visualization purposes.") +
+  scale_x_log10(labels = scales::label_number(), 
+                limits = c(1,20)) + 
+  theme(plot.caption.position = "plot",
+        plot.caption = element_text(hjust = 0),
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+```
+
+```{r}
+k_choice <- knn_tune %>%
+  select_best(metric = "rmse")
+#k_choice
+
+knn_wflow <- knn_wflow %>%
+  finalize_workflow(k_choice)
+```
+
+```{r}
+# Fit final model
+final_mod <- fit(knn_wflow, data = train_full)
+#final_mod
+```
+
+# Experimental Results {#experimental-results}
+
+Here, we discuss how we determine the optimal choice of $K$ for our KNN Regression model, and we show the importance of each of the features in our model.
+
+## Visualizing the Optimal Choice of $K$ {#visualizing-optimal-k}
+
+In Figure \@ref(fig:k-plt), we see the plot referenced in Section \@ref(training) that compares the MSE, our model evaluation metric, against number of neighbors $K$ in the cross validated KNN Regression model. We transform the number of neighbors $K$ with a log in order to better visualize the value of $K$ at which the model reaches a minimum MSE. Now that we have our optimal KNN Regression model and our optimal choice of $K$ for that model, we can use our model with $K = 2$ nearest neighbors to train our predictor.
+
+```{r k-plt, fig.height = 4, fig.width = 4, fig.align = "center", fig.cap="Mean Square Error over Choice of K."}
+# Choosing best K for KNN
+k_plt
+```
+
+## Feature Importance {#feature-importance}
+
+We also may be interested in understanding the importance of each of the features in our model to assess its strengths and weaknesses. To do so, we create a feature importance plot that shows the MSE of each feature after permutations. If shuffling the observations in a feature causes a large degradation in model performance, we know that feature must be important. In other words, if the MSE of a feature after permutations is higher, the feature is more important.
+
+In Figure \@ref(fig:var-imp), we see that the rotor swept area is by far the most important feature, followed by the total height of the turbine. The year in which the turbine became operational, the turbine's hub height, the longitude, and the latitude of the turbine all have similar importance, but each is far less important than turbine height and rotor swept area. The retrofit binary indicator feature has the lowest aggregate importance. Note that the dashed line in the plot represents the MSE for the full KNN Regression model.
+
+This plot is quite informative in our understanding of the model. It validates the context for the model, particularly the fact that the amount of area that a turbine's rotor sweeps affects its capacity. Likewise, it makes sense that the turbine's height would affect its capacity and allow it to produce more energy.
+
+```{r}
+ggplot_imp <- function(...) {
+  obj <- list(...)
+  metric_name <- attr(obj[[1]], "loss_name")
+  metric_lab <- paste("Mean Square Error (MSE)", 
+                      "after permutations")
+  
+  full_vip <- bind_rows(obj) %>%
+    filter(variable != "_baseline_")
+  
+  perm_vals <- full_vip %>% 
+    filter(variable == "_full_model_") %>% 
+    group_by(label) %>% 
+    summarise(dropout_loss = mean(dropout_loss)) %>%
+    mutate(dropout_loss = dropout_loss^2) # Changed to MSE
+  
+  p <- full_vip %>%
+    filter(variable != "_full_model_") %>% 
+    mutate(variable = fct_reorder(variable, dropout_loss)) %>%
+    ggplot(aes(dropout_loss, variable)) 
+  if(length(obj) > 1) {
+    p <- p + 
+      facet_wrap(vars(label)) +
+      geom_vline(data = perm_vals, aes(xintercept = dropout_loss, color = label),
+                 size = 1.4, lty = 2, alpha = 0.7) +
+      geom_boxplot(aes(color = label, fill = label), alpha = 0.2)
+  } else {
+    p <- p + 
+      geom_vline(data = perm_vals, aes(xintercept = dropout_loss),
+                 size = 1.4, lty = 2, alpha = 0.7) +
+      geom_boxplot(fill = "#91CBD765", alpha = 0.4)
+  }
+  p +
+    theme(legend.position = "none") +
+    labs(x = metric_lab, 
+         y = "Features",  fill = NULL,  color = NULL,
+         title = "Feature Importance in the KNN Model") + 
+    theme(plot.title = element_text(hjust = 0.5, size = 16, face = "bold")) + 
+    scale_y_discrete(labels=c("t_rsa" = "Rotor Swept Area", "t_ttlh" = "Turbine Total Height", "p_year" = "Year Operational", "t_hh" = "Hub Height", "xlong" = "Longitude", "ylat" = "Latitude",  "retrofit" = "Retrofit Indicator"))
+}
+```
+
+```{r, fig.height = 5, fig.width = 6.5, var-imp, fig.cap="A visualization of feature importance in our KNN Regression model."}
+vip_plt <- 
+  explain_tidymodels(
+    final_mod, 
+    data = train_full %>% dplyr::select(-t_cap), 
+    y = train_full$t_cap,
+    label = "RDA",
+    verbose = FALSE
+  ) %>% 
+  model_parts() 
+
+ggplot_imp(vip_plt)
+```
+
+## Performance on the Test Set
+
+In Figure \@ref(fig:pred-plt), we see that our model performs well on the test set against some of the numeric features, specifically turbine hub height, total turbine height, and the rotor swept area. The red points, which represent the predicted turbine capacity plotted against each respective feature in the test set seem to match the training data well. 
+
+```{r}
+y_pred <- predict(final_mod, X_test)
+
+pred_data <- as.data.frame(y_pred) %>%
+  rename("pred" = `.pred`)
+test_and_pred <- cbind(X_test, pred_data)
+```
+
+```{r}
+p1 <- ggplot() +
+  geom_point(data = test_and_pred, aes(x = t_hh, y = pred, color = "#590925"),
+             alpha = 0.7) +
+  geom_point(data = train_full, aes(x = t_hh, y = t_cap, color = "#D4DCFF"),
+             alpha = 0.1) + 
+  labs(x = "Hub Height (m)",
+       y = "Capacity (kW)",
+       title = "Capacity vs. Hub Height") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15)) +
+  scale_color_identity("Category", 
+                       labels = c("Test Predictions", "Training Data"),
+                       guide = "legend")
+```
+
+```{r}
+p3 <- ggplot() +
+  geom_point(data = test_and_pred, aes(x = t_rsa, y = pred),
+             alpha = 0.7, color = "#590925") +
+  geom_point(data = train_full, aes(x = t_rsa, y = t_cap),
+             alpha = 0.1, color = "#D4DCFF") + 
+  labs(x = "Rotor Swept Area (m^2)",
+       y = "Capacity (kW)",
+       title = "Capacity vs. Swept Area") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 15))
+```
+
+```{r}
+p4 <- ggplot() +
+  geom_point(data = test_and_pred, aes(x = t_ttlh, y = pred),
+             alpha = 0.7, color = "#590925") +
+  geom_point(data = train_full, aes(x = t_ttlh, y = t_cap),
+             alpha = 0.1, color = "#D4DCFF") + 
+  labs(x = "Total Height (m)",
+       y = "Capacity (kW)",
+       title = "Capacity vs. Total Height") + 
+  theme(plot.title = element_text(hjust = 0.5, size = 15))
+```
+
+```{r pred-plt, fig.cap = "Visualization of the predictions of our model compared to the training set."}
+grid.arrange(p1, p3, p4,
+             layout_matrix = rbind(c(1), c(3, 4)))
+```
+
+
+# Prediction Error Estimation {#prediction-error-estimation}
+
+Finally, to predict the estimated error on the test set, we use the k-fold cross validation from training. Specifically, for each $K$ number of neighbors we test, our k-fold cross validation outputs an MSE. To predict the MSE of the model on the test set, we can then average the MSE's from each $K$, given by 
+
+$$\widehat{L}_{LS} =  \frac{\sum_{i=1}^k MSE_i}{\max \{i\}},\, i\in \{1,\dots, 20\}.$$
+Although we use $K=2$ in our KNN model, this seems like a viable estimate because it is unclear whether another value of $K$ will perform better on the test set. Still, this will likely be a pessimistic estimate of our MSE because the value $K=2$ neighbors is approximately 802, and MSE increases significantly as $K$ increases. We show several choices of $K$ and their corresponding MSE's from cross validation in Table 2.
+
+```{r, fig.pos = "!H"}
+k_v_mse <- knn_tune %>%
+  collect_metrics() %>%
+  filter(neighbors %in% c(1, 2, 3, 5, 10, 12, 15, 18, 20)) %>%
+  mutate(mse = mean^2) %>%
+  mutate(mse = round(mse, 2)) %>%
+  dplyr::select(neighbors, mse) %>%
+  rename(K = neighbors, MSE = mse) %>%
+  as.data.frame()
+
+kable(k_v_mse,
+      caption = "The values of K against the cross-validated MSE for the KNN Regression model.") %>%
+  kable_styling(position = "center")
+```
+
+Clearly, at high values of $K$, namely $K>5$, the MSE increases significantly, which is also evident in Figure \@ref(fig:k-plt). Using our estimate, we have that $$\widehat{L}_{LS} =  1303.$$
+
+```{r}
+# Generate prediction vector
+mse_est <- knn_tune %>%
+  collect_metrics() %>%
+  mutate(mse = mean^2) %>%
+  summarize(mse_pred = mean(mse))
+colnames(mse_est) <- c('res')
+
+# Put all results together
+colnames(y_pred) <- c('res')
+
+# rbind everything together for proper formatting
+y <- rbind(mse_est, y_pred)
+
+#write_csv(y, "y.csv")
+```
+
+\newpage
+
+# Conclusion
+
+In this report, we outline the procedure we use to choose and train a KNN Regression model. After trying different models, we find a set of predictors that minimizes MSE, and we then determine that setting the number of neighbors in our regression model to two further minimizes the loss. We then show how we use that model to predict turbine capacity based on the test set.  
+
+Without the true test set predictions, we cannot truly evaluate our model's performance, but based on the our predicted loss and our plots of the model's predictions on the test set compared to the training data, we should be fairly confident in our model's ability to predict turbine capacity well. 
